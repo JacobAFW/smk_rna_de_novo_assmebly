@@ -1,0 +1,181 @@
+# Snakefile 
+# Prerequisites (on Gadi): source /g/data/pq84/malaria/snakemake_pipeline/snakemake_setup.sh
+
+
+################################################ Define paths using config file #########################################################################
+
+
+configfile: "config/config.yaml"
+fasta_path=config['fasta_path']
+bed_file_path=config['bed_file_path']
+gff_path=config['gff_path']
+star_path=config['star_path']
+source_dir=config['source_dir']
+adapters=config['adapters']
+rna_bloom=config['rna_bloom']
+
+################################################ Set up: define input files, wildcards, etc. #########################################################################
+
+## Defining the samples to be used for the {sample} wildcard
+SAMPLES, = glob_wildcards(f'{source_dir}/{{sample}}_1.fq.gz') 
+
+################################################## Define final files #######################################################################
+
+rule all:
+    input:
+        expand("output/assembly/{sample}/rnabloom.transcripts.fa", sample = SAMPLES),
+        expand('output/mapped/{sample}_Aligned.sortedByCoord.out.bam', sample = SAMPLES),
+        "output/fastqc/"
+
+###################################################### Rules ##############################################################################
+
+# Define local rules - not run with scheduler
+localrules: all
+
+# Assemble with RNA bloom
+
+rule rna_bloom:
+    input:
+        rna_bloom=rna_bloom,
+        f_in="output/trimmed/{sample}_trimmed_1.fq.gz",
+        r_in="output/trimmed/{sample}_trimmed_2.fq.gz"
+    output:
+        "output/assembly/{sample}/rnabloom.transcripts.fa",
+        "output/assembly/{sample}/rnabloom.transcripts.short.fa",
+        "output/assembly/{sample}/rnabloom.transcripts.nr.fa"
+    params:
+        "output/assembly/{sample}"
+    shell:
+        """
+        java -jar {input.rna_bloom} \
+        -left {input.f_in} -right {input.r_in} \
+        -revcomp-right \
+        -t 5 \
+        -outdir {params}
+        """
+
+# Map with STAR
+
+## Max intron size of Pf is ~1000 & min is 5- specified in input
+
+pfx="output/mapped/"
+rule star_aligner:
+    input:
+        "output/genome_index/Genome",
+        "output/genome_index/SA",
+        "output/genome_index/SAindex",
+        star=star_path,
+        f_in="output/trimmed/{sample}_trimmed_1.fq.gz",
+        r_in="output/trimmed/{sample}_trimmed_2.fq.gz"
+    output:
+        *[pfx + filename for filename in [
+            '{sample}_Aligned.sortedByCoord.out.bam',
+            '{sample}_Log.final.out',
+            '{sample}_Log.out',
+            '{sample}_Log.progress.out',
+            '{sample}_SJ.out.tab',
+            '{sample}_ReadsPerGene.out.tab'
+            ]]
+    params:
+        pfx=f"{pfx}{{sample}}_",
+        genome="output/genome_index"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --genomeDir {params.genome} \
+        --readFilesIn {input.f_in} {input.r_in} \
+        --readFilesCommand zcat \
+        --outSAMtype BAM SortedByCoordinate \
+        --outSAMunmapped Within \
+	    --outFileNamePrefix {params.pfx} \
+	    --outSAMattributes Standard \
+        --alignIntronMin 5 \
+        --limitBAMsortRAM 1847354302 \
+        --alignIntronMax 1000 \
+        --quantMode GeneCounts
+        """
+
+# Index genome for STAR
+
+rule star_index:
+    input:
+        fasta=fasta_path,
+        star=star_path,
+        gff=gff_path
+    output:
+        "output/genome_index/Genome",
+        "output/genome_index/SA",
+        "output/genome_index/SAindex",
+        "output/genome_index/chrLength.txt",
+        "output/genome_index/chrName.txt",
+        "output/genome_index/chrStart.txt",
+        "output/genome_index/exonGeTrInfo.tab",
+        "output/genome_index/exonInfo.tab",
+        "output/genome_index/geneInfo.tab",
+        "output/genome_index/genomeParameters.txt",
+        "output/genome_index/sjdbInfo.txt",
+        "output/genome_index/sjdbList.fromGTF.out.tab",
+        "output/genome_index/sjdbList.out.tab",
+        "output/genome_index/transcriptInfo.tab"
+    params:
+        "output/genome_index"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --runMode genomeGenerate \
+        --genomeSAindexNbases 11 \
+        --genomeDir {params} \
+        --genomeFastaFiles {input.fasta} \
+        --sjdbGTFfile {input.gff} \
+        --sjdbGTFtagExonParentTranscript Parent \
+        --sjdbGTFfeatureExon exon \
+        --sjdbOverhang 149 \
+        --outFilterMultimapNmax 20
+        """
+
+# Remove adapaters
+
+rule bbduk:
+    input:
+        adapters=adapters,
+        f_in=f"{source_dir}/{{sample}}_1.fq.gz",
+        r_in=f"{source_dir}/{{sample}}_2.fq.gz"
+    output:
+        f_out="output/trimmed/{sample}_trimmed_1.fq.gz",
+        r_out="output/trimmed/{sample}_trimmed_2.fq.gz",
+        stats="output/trimmed/{sample}.stats"
+    shell:
+        """
+        bbduk.sh \
+        in1={input.f_in} in2={input.r_in} \
+        out1={output.f_out} out2={output.r_out} \
+        ktrim=r \
+        k=12 \
+        mink=6 \
+        hdist=1 \
+        ref={input.adapters} \
+        tpe \
+        tbo \
+        stats={output.stats}
+        """
+
+# QC fastq files
+
+rule qc:
+    input:
+        source_dir
+    output:
+        fast="output/fastqc/",
+        multi="output/multiqc/"
+    params:
+        in_dir=f"{source_dir}/*fq.gz",
+    shell:
+        """
+        mkdir output/fastqc
+
+        fastqc -t 5 -o {output.fast} {params.in_dir}
+        """
+
+
